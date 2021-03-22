@@ -1,0 +1,406 @@
+---
+title: "Identification of Alternative Splicing and polyadenylation in bulk RNA-seq data"
+author: "Ying Zheng"
+date: "24/02/2021"
+output: 
+  html_document:
+    toc: true
+    theme: united
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+NOTE: The context of this R markdown file includes all the R code requied for the analysis of Differential polyadenylation site (PAS) usage analysis of 3P-Seq data. Refer to the PART 2- 3P-Seq analysis of the Protocol section.
+
+# 1. Data downloading and pre-processing 
+NOTE: The data downloading and pre-processing steps were performed on terminal rather than R console. Refer to the supplementary bash file "Data_PreProcessing.3PSeq.sh" for the complete commands.
+
+The raw data used in this analysis were downloaded from Sequence Read Archive [SRA] using the `prefetch` command from SRA toolkit. Give the SRA Accession Ids (1553129 to 1553136) in sequence, the raw SRA files were downloaded in parallel using GNU parallel (Tange, O., 2018). Then fastq files can be extracted directly from these SRA files using `fastq-dump` from SRA toolkit for next-step processing. As the length of the reads gained in this set of PolyA-Seq data was short (~35 bases), Illumina adapter trimming was performed with `cutadapt` to remove the influence of the adapter sequence on analysis results. Meanwhile, according to the description of library preparation steps in the original article, the sequencing of this set of data was performed on the antisense strand. Therefore, after adapter trimming, the reads saved in fasq files were reverse complemented with the help of FASTX toolkit to obtain the sense strand sequence before genome alignment. The mouse genome alignment of the data was accomplished using bowtie aligner, and the success rate of the alignment were calculated and visualized directly with the mapped SAM files.
+
+
+# 2. Preparing pA sites annotations
+The tsv file of pA site annotation "atlas.clusters.2.0.GRCm38.96.tsv" can be downloaded directly using the PolyASite 2.0 database from https://polyasite.unibas.ch. The processing of the pA site annotation file was preformed firstly in R console as shown below, and then in terminal using the Linux command-line described in supplementary file "Anno_Processing.3PSeq.sh". Only the pA sites annotated as Terminal Exon (TE) or 1000 nt downstream of an annotated terminal exon (DS) were retained as 3’UTR pA sites for analysis.
+
+NOTE: To obtain pA site peaks, we anchored at each pA cleavage site, and visualised the average read coverage on flanking regions around the cleavage sites. The results showed that the peaks of the mapped reads were mainly dispersed within ~60 bp upstream of the cleavage sites (Refer to the supplementary figure “merge.heatmap.png”). Therefore, we extended the coordinates of pA sites from the annotation file to 60 bp upstream of their cleavage sites in the analysis of the PolyA-Seq data. Refer to the supplementary file "Data_PreProcessing.3PSeq.sh" and "Anno_Processing.3PSeq.sh" for step-by-step procedure of the flanking region selection and coordinates extension.
+
+## 2.1 Select the analysis-related information to generate the new annotation file
+```{r}
+# Load required libraries
+library(magrittr)
+library(dplyr)
+
+# Load the unprocessed annotation file
+anno <- read.delim("/Users/evelynzheng/3PSeq_files/atlas.clusters.2.0.GRCm38.96.tsv", stringsAsFactors = FALSE, check.names = FALSE, header = TRUE) %>% 
+  select(chrom, chromStart, chromEnd, name, score, strand, rep, annotation, gene_name, gene_id) %$%
+  .[(.$annotation %in% "TE") | (.$annotation %in% "DS"), ]
+# Select our intesrested pA sites annotated as Terminal Exon (TE), 1,000 nt DownStream of an annotated terminal exon (DS)
+```
+
+## 2.2 Modify the information formats in the new annotation file
+NOTE: As the tools that we will use for pA site usage analysis were designed for differential exon usage and splicing analysis, the input unique feature IDs (namely unique pA site cluster IDs) are expected to be in the format of 'group ID: feature ID’ (namely 'gene ID: pA site cluster ID'), while the cluster IDs in both the annotation file and the count table are in the format of ‘group ID: feature ID: strand’. Therefore, for the convenience of downstream analysis and to avoid duplicates in the cluster IDs, we removed the last common is the original cluster IDs and replace the strand information `+` and `-` with letters `F` (Forward) and `R`(Reverse) individually using the R function below. 
+```{r}
+anno$name <- anno$strand %>% replace(. %in% "+", "F") %>% # Replace the strand information '+' with 'F'
+  replace(. %in% "-", "R") %>% # Replace the strand information '-' with 'R'
+  paste0(anno$gene_name, ":", anno$rep, .) # Generate new unique pA site cluster IDs
+
+anno$chrom <- paste0("chr", anno$chrom) # Change the format of chromosome column for downstream analysis
+
+# Replace coordinates of all ployA sites with their corresponding cleavage sites
+anno$chromStart <-  anno$rep -1
+anno$chromEnd <-  anno$rep
+```
+
+## 2.3 Apply the chromosome level filtering to the annotation file
+```{r}
+# Remove the unimportant chromosomes
+anno %<>% {
+  chrom.list <- paste0("chr", as.character(c(1:19, "X", "Y")))
+  .[.$chrom %in% chrom.list, ]}
+```
+
+## 2.4 Generate annotation files for each strand
+```{r}
+# Generate annotation files for each strand for genomeCoverage plotting
+anno %T>% 
+  {
+    anno.fwd = .[.$strand %in% "+", ]
+    write.table(anno.fwd, file = "polyA_annotation.fwd.bed", row.names = FALSE, col.names = FALSE, sep = "\t", quote = FALSE)
+    } %>% {
+    anno.rev <- .[.$strand %in% "-", ]
+    write.table(anno.rev, file = "polyA_annotation.rev.bed", row.names = FALSE, col.names = FALSE, sep = "\t", quote = FALSE)
+  }
+```
+
+## 2.5 Save the annotation file in txt format for further processing in terminal
+```{r}
+anno %>% write.table(file = "polyA_annotation.bed", row.names = FALSE, col.names = FALSE, sep = "\t", quote = FALSE)
+```
+NOTE: After the further processing in terminal, the final processed file used in downstream analysis was named as "flanking60added.polyA_annotation.bed". Refer to the supplementary file "Anno_Processing.3PSeq.sh" for details.
+
+
+# 3 Counting Reads
+Then we will read all bam files obtained as input for `featureCounts()` from `Rsubread` package (Liao, Y., 2019) to acquire the raw counts of reads mapped to each annotated pA site. The count table was saved as a file for further differential polyadenylation site usage analysis using different tools.
+
+### 3.1 Load required libraries
+The following packages were used for this part of the analysis. Make sure to install the packages if they are not already installed. 
+
+```{r}
+# Load required libraries
+c("Rsubread","tibble") %>% lapply(library, character.only = TRUE) %>% invisible
+```
+
+### 3.2 Prepare the processed pA sites annotation file for featureCounts
+We selected eight typical elements useful for differential polyadenylation site usage analysis, including unique pA site cluster ID, chromosome name, start and end positions of the pA site cluster, strand on which the cluster is encoded, the overlapping gene ensembles and their corresponding gene symbols, and the representative pA site of the cluster. 
+```{r}
+anno <- read.table(file = "flanking60added.polyA_annotation.bed", stringsAsFactors=FALSE, check.names=FALSE, header=FALSE, sep = "")
+colnames(anno) <- c("Chr", "Start", "End", "GeneID", "Score", "Strand", "repID", "Anno", "Symbol", "Ensembl") # Rename the columns
+anno <- dplyr::select(anno, GeneID, Chr, Start, End, Strand, Ensembl, Symbol, repID) # Select the columns useful for 
+```
+
+### 3.3 Apply featureCounts to acquire the raw counts 
+Then we will read all bam files obtained as input for featureCounts to acquire the raw counts of reads mapped to each annotated pA site. The count table was saved as a file for further differential polyadenylation site usage analysis using different tools.
+NOTE: Before running this step, make sure you have the folder containing bam files in the current working directory.
+```{r}
+# As the running of featureCounts requires around 25 G memory, this step was running on server and the result was saved as "countData.RData" and loaded in the next R session.
+# countData <- dir("bamfiles", pattern="sorted.bam$", full.names = TRUE) %>%  # Read all bam files as input for featureCounts
+#   featureCounts(annot.ext = anno, isGTFAnnotationFile = FALSE, minMQS = 0, useMetaFeatures = TRUE, 
+#                 allowMultiOverlap = TRUE, largestOverlap = TRUE, strandSpecific = 1,
+#                 countMultiMappingReads = TRUE, primaryOnly = TRUE, isPairedEnd = FALSE, nthreads = 12) %T>% 
+#   save(file = "APA_countData.RData")
+```
+NOTE: Be conscious if you wish to change any of the parameters listed in the `featureCounts` function. To retain more mapped reads, here we used `countMultiMappingReads = TRUE` to include the counts of reads those were uniquely mapped to an annotated pA site. Remember to make the `isPairedEnd = TRUE` if the data you used is generated using paired-end sequencing protocols. Modify the strandSpecific parameter to the sequencing direction of your data corresponding to the 3’seq assay used (empirically, visualizing the data in a genome browser over genes on plus and minus strands will clarify this).
+
+### 3.4 Apply non-sepecific filtering of countData
+Filtering can significantly improve the statistical robustness in differential pA site usage tests. First, we removed those genes with only one pA site, on which differentially pA site usage cannot be defined. Second, we apply non-specific filtering based on coverage: counts are filtered by cpm (counts per million) less than 1 in x out of n samples, where x is the minimum number of replicates in any condition. n = 8 and x = 2 for this example data.
+```{r}
+load(file = "APA_countData.RData") # Avoid this step if it is already loaded 
+
+# Non-specific filtering: Remove the pA sites with low counts
+ori <- as.data.frame(countData$counts)
+retain <- rownames(ori)[rowSums(edgeR::cpm(ori) > 1) >= 2] # Remove the pA sites not differentially expressed in the samples
+countData <- ori[rownames(ori) %in% retain, ] 
+anno <- anno[anno$GeneID %in% rownames(countData), ] 
+
+# Remove genes with only 1 site and  NA in geneIDs
+dnsites <- anno %>% group_by(Symbol) %>% summarise(nsites=n())  %>% filter(nsites > 1 & !is.na(Symbol))
+anno <- anno %>% filter(Symbol %in% dnsites$Symbol)
+countData <- countData[rownames(countData) %in% anno$GeneID, ]
+```
+
+
+# 4 Differential polyadenylation sites usage analysis using DEXSeq and diffSplice pipelines
+## 4.1 Using DEXSeq package 
+### 4.1.1 Load library and create a sample table to define the experimental design
+```{r}
+packages <- "DEXSeq"
+invisible(lapply(packages, library, character.only = TRUE))
+sampleTable <- data.frame(row.names = c("WT_1","WT_2","DKO_1","DKO_2", "DKOsiRNA_1", "DKOsiRNA_2", "DKONTsiRNA_1", "DKONTsiRNA_2"), 
+                          condition = c(rep("WT", 2), rep("DKO", 2),  rep("KD", 2), rep("Ctrl", 2)), 
+                          libType = rep("single-end", 8))
+```
+NOTE: The row names should be consistent with the bam file names used by `featureCounts` to count the reads. sampleTable consists of details of each sample which includes- library-type and condition. This is required to define the contrasts or test group for detecting differential usage.
+
+### 4.1.2 Prepare the pA sites information file 
+PA site information in form of GRanges object is required as an input to create DEXSeq object. Match the gene Ids with the read counts and extract their specific annotation present in the prepared annotation object to create PASinfo object.
+```{r}
+# Prepare the GRanges object for DEXSeqDataSet object construction
+PASinfo <- GRanges(seqnames = anno$Chr,
+                   ranges = IRanges(start = anno$Start, end = anno$End),
+                   strand = Rle(anno$Strand))
+mcols(PASinfo)$PASID <- anno$repID
+mcols(PASinfo)$GeneEns <- anno$Ensembl
+mcols(PASinfo)$GeneID <- anno$Symbol
+
+# Prepare the new feature IDs, replace the strand information with letters to match the current pA site clusterID
+ori.anno.strand <- as.character(anno$Strand)
+new.anno.strand <- replace(ori.anno.strand, ori.anno.strand %in% "+", "F")
+new.anno.strand <- replace(new.anno.strand, ori.anno.strand %in% "-", "R")
+new.featureID = paste0(as.character(anno$repID), new.anno.strand)
+```
+NOTE: Be careful with the names of the columns of the processed annotation file. With different annotations, the headers can change and cause a problem while running this step.
+
+### 4.1.3 Create the DEXSeq object
+Use the read counts generated in step 3 and the PAS information obtained from the previous step to create the DEXSeq object. The sampleData takes a data frame input defining the samples (and their attributes- library type and condition), `design` uses sampleData to generate a design matrix for the differential testing. For feature information, pA site IDs and their corresponding gene are required.  
+
+```{r}
+colnames(countData) <- rownames(sampleTable) # Rename the columns of countData using sample names in sampleTable
+dxd <- DEXSeqDataSet(countData = countData,
+                     sampleData = sampleTable, 
+                     design = ~ sample + exon + condition:exon,
+                     featureID = new.featureID,
+                     groupID = anno$Symbol,
+                     featureRanges = PASinfo)
+```
+NOTE: This step might take some time. Once the object is created, explore the columns for initial understanding of data.
+
+```{r}
+# Explore/Inspect the DEXSeqDataSet object
+head(counts(dxd), 5)
+colData(dxd)
+split(seq_len(ncol(dxd)), colData(dxd)$exon)
+#head(featureCounts(dxd), 5)
+head(rowRanges(dxd), 3)
+sampleAnnotation(dxd)
+```
+
+### 4.1.4 Define the contrast pairs in countData
+DEXSeq pipeline can be used to perform differnetial pA site usage in contrast pairs. If not defined, the conditions saved in DEXSeqDataSet object will be transferred to alphabetical order-based factors, and the contrast pairs will be composed of 1) one of the three conditions with high levels, and 2) the condition with the lowest level. Therefore, we can define the contrast parirs through defining the levels of conditions in DEXSeqDataSet object.
+```{r}
+dxd$condition <- factor(dxd$condition, levels = c("DKO", "WT", "Ctrl", "KD"))
+# The contrast pairs will be "WT-DKO", "Ctrl-DKO", "Ctrl-DKO", "KD-DKO"
+```
+
+### 4.1.5 Normalization and Dispersion Estimation
+Next, we perform the normalisation and estimate the variability of the data using the following commands. 
+```{r, fig.align="center"}
+dxd = estimateSizeFactors(dxd)
+dxd = estimateDispersions(dxd)
+plotDispEsts(dxd) # Visualization of the dispersion esitimation result
+```
+
+### 4.1.6 Differential pA site usage testing
+After the estimation of variation, we test for differential exon usage for each gene and generate the results. The results are calculated at FDR 10%.
+```{r}
+dxd = testForDEU(dxd)
+#Estimate fold changes
+dxd = estimateExonFoldChanges( dxd, fitExpToVar="condition")
+dxr = DEXSeqResults(dxd)
+dxr
+#dxr = na.omit(dxr)
+mcols(dxr)$description
+## ----tallyPASs------------------------------------------------------------
+table(dxr$padj < 0.1) # Check the number of differential pA sites (FDR < 0.1)
+## ----tallyGenes------------------------------------------------------------
+table(tapply(dxr$padj < 0.1, dxr$groupID, any)) # Check the number of gene overlapped with differential pA site clusters (FDR < 0.1)
+```
+
+### 4.1.7 Visualization of differnetial pA site usage
+```{r}
+# select top significant differntial pA site usage
+packages <- "magrittr"
+invisible(lapply(packages, library, character.only = TRUE))
+
+topdiff.PAS <- dxr %>% as.data.frame %>% rownames_to_column %>% arrange(padj) %$% groupID[1:100]
+head(topdiff.PAS)
+```
+
+The plotDEXSeq function was used for visualization of differential ployA usage result. Use different gene names to explore the results: 
+```{r, fig.align="center"}
+plotDEXSeq(dxr, "S100a7a", legend = TRUE, expression = TRUE, splicing = FALSE, cex.axis = 1, cex = 1, lwd = 2)
+```
+
+To display differential ployA usage use `splicing = TRUE`:
+```{r, fig.align="center"}
+plotDEXSeq( dxr, "Pfkp", displayTranscripts=TRUE, legend=TRUE, cex.axis=1.2, cex=1.3, lwd=2 )
+```
+
+Generate plots for all the top 300 significant genes using `perGeneQValue` function:
+```{r}
+dxr = dxr[!is.na(dxr$padj),]	
+dgene <-  data.frame(perGeneQValue=perGeneQValue(dxr)) %>% rownames_to_column("groupID")
+
+dePAS <-  dxr %>% data.frame() %>% 
+  dplyr::select(-matches("dispersion|stat|countData|genomicData")) %>% 
+  inner_join(dgene) %>% arrange(perGeneQValue) %>% distinct()
+
+dePAS_sig <- filter(dePAS, padj < 0.1)
+writexl::write_xlsx(dePAS_sig, "3PSeq_DEXSeq_significant_genes.xlsx", col_names = TRUE)
+
+pdf(file= "3PSeq_DEXSeq_significant_genes.top300.pdf")
+sig_genes <- dePAS_sig %>% filter(perGeneQValue <= 0.01) %$% groupID %>% unique
+sig_genes <- sig_genes[1:300]
+
+for (geneid in sig_genes) {
+  nn = nrow(dxr[dxr$groupID %in% geneid, ])
+  if (nn > 1) {
+    plotDEXSeq(dxr, geneid, legend = TRUE, expression = FALSE, splicing = TRUE, cex.axis = 1, cex = 1, lwd = 2)
+  }
+}
+dev.off()
+```
+
+Use EnhancedVolcano package to visualise differentially ployA site usage
+```{r, fig.align="center"}
+packages <- "EnhancedVolcano"
+invisible(lapply(packages, library, character.only = TRUE))
+
+EnhancedVolcano(dePAS_sig, lab = dePAS_sig$groupID, x = 'log2fold_WT_DKO', y = 'pvalue', title = 'Volcano Plot', 
+                subtitle = 'WT vs DKO', FCcutoff = 1, labSize = 5, legendPosition = "right", 
+                caption = bquote(~Log[2]~ "Fold change cutoff, 1; FDR 10%"))
+```
+NOTE: EnhancedVolcano package was used to generate the above plot, you will need to install it if not already installed.
+
+## 4.2 Using diffSplice package
+### 4.2.1 Load required libraries
+```{r}
+library(limma)
+library(edgeR)
+```
+
+### 4.2.2 Creat the DGEList object and preprocessing
+```{r}
+dge <- DGEList(counts = countData) 
+dge <- calcNormFactors(dge) # Normalize the read counts using the TMM method.
+Treat <- factor(sampleTable$condition)
+design <- model.matrix(~0 + Treat)
+colnames(design) <- levels(Treat)
+v <- voomWithQualityWeights(dge, design, plot = FALSE)
+fit <- lmFit(v, design)
+fit <- eBayes(fit)
+```
+
+### 4.2.3 Make contrasts for differential PAS usage
+```{r}
+contrast.matrix <- makeContrasts(DKO_vs_WT = DKO-WT, Ctrl_vs_DKO = Ctrl-DKO, 
+                                 KD_vs_Ctrl = KD-Ctrl, KD_vs_DKO = KD-DKO,
+                                 levels = design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+summary(decideTests(fit2))
+```
+
+### 4.2.4 Differential pA site usage analysis
+```{r}
+ex <- diffSplice(fit2, geneid = anno$Symbol, exonid = new.featureID)
+
+#Check the top significant results with topSplice
+topSplice(ex)
+```
+NOTE: This step uses the exon information object created in 4.1.2. Make sure it is loaded in the current working environment.
+
+### 4.2.5 Visualization of the contrast DKO-WT
+```{r}
+sig1 <-topSplice(ex, n = Inf, FDR = 0.1, coef = 1, test= "t", sort.by = "logFC") #Save the results sorted by logFC with FDR < 0.1
+head(sig1)
+
+pdf(file = "3PSeq_diffSplice_plotSplice_DKO_WT.pdf")
+plotSplice(ex, coef = 1, geneid = "Terf2ip")
+plotSplice(ex, coef = 1, geneid = "S100a7a")
+plotSplice(ex, coef = 1, geneid = "Cep290")
+dev.off()
+
+pdf(file = "3PSeq_diffSplice_Volcano_DKO_WT.pdf", height = 10, width = 12)
+EnhancedVolcano(sig1, lab = sig1$GeneID, xlab = bquote(~Log[2]~ 'fold change'), 
+                x = 'logFC', y = 'P.Value', title = 'Volcano Plot', subtitle = 'DKO vs WT', 
+                # pCutoff = 10e-16, 
+                FCcutoff = 1, labSize = 8, legendPosition = "right")
+dev.off()
+
+#Save the list of top differentially spliced exons at FDR 10%
+writexl::write_xlsx(sig1, "3PSeq_diffSplice_significant_genes_DKO_WT.xlsx", col_names = TRUE)
+```
+
+### 4.2.6 Visualization of the contrast Ctrl-DKO
+```{r}
+sig2 <-topSplice(ex, n = Inf, FDR = 0.1, coef = 2, test= "t", sort.by = "logFC")
+head(sig2)
+
+pdf(file = "3PSeq_diffSplice_plotSplice_Ctrl_DKO.pdf")
+plotSplice(ex, coef = 2, geneid = "Ppil1")
+plotSplice(ex, coef = 2, geneid = "Ccdc138")
+plotSplice(ex, coef = 2, geneid = "Cep290")
+dev.off()
+
+pdf(file = "3PSeq_diffSplice_Volcano_Ctrl_DKO.pdf", height = 10, width = 12)
+EnhancedVolcano(sig2, lab = sig2$GeneID, xlab = bquote(~Log[2]~ 'fold change'), 
+                x = 'logFC', y = 'P.Value', title = 'Volcano Plot', subtitle = 'Ctrl vs DKO', 
+                # pCutoff = 10e-16, 
+                FCcutoff = 1, labSize = 8, legendPosition = "right")
+dev.off()
+
+writexl::write_xlsx(sig2, "3PSeq_diffSplice_significant_genes_Ctrl_DKO.xlsx", col_names = TRUE)
+```
+
+### 4.2.7 Visualization of the contrast KD-Ctrl
+```{r}
+sig3 <-topSplice(ex, n = Inf, FDR = 0.1, coef = 3, test= "t", sort.by = "logFC")
+head(sig3)
+
+pdf(file = "3PSeq_diffSplice_plotSplice_KD_Ctrl.pdf")
+plotSplice(ex, coef = 3, geneid = "Amy1|Rnpc3")
+plotSplice(ex, coef = 3, geneid = "Meg3")
+plotSplice(ex, coef = 3, geneid = "Tjp1")
+dev.off()
+
+pdf(file = "3PSeq_diffSplice_Volcano_KD_Ctrl.pdf", height = 10, width = 12)
+EnhancedVolcano(sig3, lab = sig3$GeneID, xlab = bquote(~Log[2]~ 'fold change'), 
+                x = 'logFC', y = 'P.Value', title = 'Volcano Plot', subtitle = 'KD vs Ctrl', 
+                # pCutoff = 10e-16, 
+                FCcutoff = 1, labSize = 8, legendPosition = "right")
+dev.off()
+
+writexl::write_xlsx(sig3, "3PSeq_diffSplice_significant_genes_KD_Ctrl.xlsx", col_names = TRUE)
+```
+
+### 4.2.8 Visualization of the contrast KD-DKO
+```{r}
+sig4 <-topSplice(ex, n = Inf, FDR = 0.1, coef = 4, test= "t", sort.by = "logFC")
+head(sig4)
+
+pdf(file = "3PSeq_diffSplice_plotSplice_KD_DKO.pdf")
+plotSplice(ex, coef = 4, geneid = "Ccdc138")
+plotSplice(ex, coef = 4, geneid = "Gas7")
+plotSplice(ex, coef = 4, geneid = "Terf2ip")
+plotSplice(ex, coef = 4, geneid = "Amy1|Rnpc3")
+plotSplice(ex, coef = 4, geneid = "Ppil1")
+plotSplice(ex, coef = 4, geneid = "Ankrd10")
+plotSplice(ex, coef = 4, geneid = "Wdcp")
+dev.off()
+
+pdf(file = "3PSeq_diffSplice_Volcano_KD_DKO.pdf", height = 10, width = 12)
+EnhancedVolcano(sig4, lab = sig4$GeneID, xlab = bquote(~Log[2]~ 'fold change'), 
+                x = 'logFC', y = 'P.Value', title = 'Volcano Plot', subtitle = 'KD vs DKO', 
+                # pCutoff = 10e-16, 
+                FCcutoff = 1, labSize = 8, legendPosition = "right")
+dev.off()
+
+writexl::write_xlsx(sig4, "3PSeq_diffSplice_significant_genes_KD_DKO.xlsx", col_names = TRUE)
+```
+
+## Print Session Info-
+```{r}
+  print(sessionInfo())
+```

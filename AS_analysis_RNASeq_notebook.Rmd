@@ -1,0 +1,443 @@
+---
+title: "Identification of Alternative Splicing and polyadenylation in bulk RNA-seq data"
+author: "Gunjan"
+date: "22/01/2021"
+output: html_notebook
+---
+
+# Introduction
+NOTE: The context of this R notebook includes all the R code requied for the analysis of Differential splicing analysis of bulk RNA-Seq data. Refer to the PART 1- Bulk RNA-Seq analysis of the Protocol section.
+
+# 1. Data downloading and pre-processing 
+The raw data can be downloaded from Sequence Read Archive [SRA] using the 'prefetch' command from SRA toolkit. Give the SRA Accession Ids in sequence in the following command to download them in parallel using GNU parallel. Once you have the raw files, extract the fastq files from these archive files with the help of 'fastq-dump'. Download the required reference genome and annotation from www.ensembl.org. For the pre-processing step, quality check was performed using the 'FASTQC' followed by mapping of reads to the reference genome using 'STAR' aligner. Refer to the supplementary file- "downloading_data_preprocessing.sh" for step by step procedure.
+
+To download SRA files of accession ids from SRR10261601 to SRR10261606 in parallel, type the following commands on the terminal-
+```{bash}
+seq 10261601 10261606 | parallel prefetch SRR{} 
+parallel -j 3 fastq-dump --gzip --skip-technical --read-filter pass --dumpbase --split-e --clip --origfmt {} ::: <name of sra files together> 
+```
+
+The reference genome and annotations for Mouse (Genome assembly GRCm39) were downloaded from www.ensembl.org. 
+
+```{bash}
+wget -nv -O annotation.gtf.gz http://ftp.ensembl.org/pub/release-103/gtf/mus_musculus/Mus_musculus.GRCm39.103.gtf.gz \ && gunzip -f annotation.gtf.gz 
+
+wget -nv -O genome.fa.gz http://ftp.ensembl.org/pub/release-103/fasta/mus_musculus/dna/Mus_musculus.GRCm39.dna.primary_assembly.fa.gz \ && gunzip -f genome.fa.gz 
+GTF=$(readlink -f annotation.gtf) 
+GENOME=$(readlink -f genome.fa) 
+```
+
+## 1.2 Pre-processing 
+
+### 1.2.1 Quality Control
+The initial quality check was performed using FASTQC (v0.11.9). This will generate individual html files for each sample with a quality report. 
+
+```{bash}
+mkdir fastqc_out 
+parallel "fastqc {} -o fastqc_out" ::: $RAW_DATA/*.fastq.gz 
+```
+
+### 1.2.2 Read alignment 
+The next step in pre-processing includes mapping the reads to the reference genome. We first build the index for the reference genome and then use read pairs to align them (alternatively prebuilt indexes are available from the STAR web13. STAR (v2.7.5c) aligner was used for this purpose.
+
+Run the following commands as a bash script.
+```{bash}
+#Build STAR index 
+GDIR=STAR_indices 
+mkdir $GDIR 
+STAR --runMode genomeGenerate --genomeFastaFiles $GENOME --sjdbGTFfile $GTF --runThreadN 8 --genomeDir $GDIR 
+ODIR=results/mapping 
+mkdir -p $ODIR
+#Align reads to the genome 
+for fq1 in $RAW_DATA/*R1.fastq.gz;  
+do 
+fq2=$(echo $fq1 | sed 's/1.fastq.gz/2.fastq.gz/g'); 
+OUTPUT=$(basename ${fq1}| sed 's/R1.fastq.gz//g'); 
+STAR --genomeDir $GDIR \ 
+ --runThreadN 12 \ 
+ --readFilesCommand zcat \ 
+ --readFilesIn  ${fq1} ${fq2}\ 
+ --outFileNamePrefix $ODIR\/${OUTPUT} \ 
+ --outSAMtype BAM SortedByCoordinate \ 
+ --outSAMunmapped Within \ 
+ --outSAMattributes Standard 
+Done 
+```
+
+We now have sorted BAM files for further analysis.  
+
+# 2. Preparing Exon annotations
+Run the supplemntary file- "prepare_mm10_exon_annotation.R" with the downloaded annotation in GTF format on the terminal to prepare the annotations. To run this file type this in terminal 
+Save the given code as 'prepare_mm10_exon_annotation.R' file and run it on the terminal-
+Rscript prepare_mm10_exon_annotation.R annotation.gtf
+```{r}
+#! /usr/bin/env Rscript
+#To run- Rscript prepare_mm10_annotation.R <GTF_file>
+library(rtracklayer)
+library(tidyverse)
+args = commandArgs(trailingOnly = TRUE)
+gff_mm10 <- args[1]
+mgg <- import(gff_mm10)
+
+anno = mgg %>% data.frame %>% 
+  mutate(seqnames = as.character(seqnames)) %>% 
+  dplyr::filter(!grepl("chr[1-19]|X|Y", seqnames)) %>% 
+  filter(type %in% "exon") %>% 
+  select(seqnames, start,   end ,width, strand, gene_name,  transcript_id)  %>% distinct() %>%
+  group_by(gene_name, seqnames, start, end, width, strand) %>% 
+  summarise(transcript_ids = paste(transcript_id, sep="",collapse=",")) %>% 
+  ungroup()  %>%  
+  mutate(number = 1) %>% 
+  arrange( seqnames,   start ,    end) %>%  group_by(gene_name, seqnames) %>% #
+  mutate(ticker = cumsum(number)) %>% 
+  mutate(ExonID = paste(gene_name, ".",seqnames,".", ticker, sep="")) %>%
+  dplyr::select(-number, ticker) %>%
+  add_count(gene_name) %>%
+  data.frame 
+colnames(anno) <- c("GeneID", "Chr", "Start", "End", "Width", "Strand", "TranscriptIDs", "Ticker", "ExonID", "n")
+save(anno, file=paste("mm10_exon_anno.RData", sep=""))
+```
+
+The GTF file contains multiple exon entries for different transcripts. This file is used to ‘collapse’ the multiple transcript IDs for each exon using a comma. It is an important step to define exon counting bins and to retain the information about overlapping genes. 
+
+# 3 Counting Reads
+For counting the number of reads mapped to different exons, featureCounts from the Rsubread package was used. 
+
+### 3.1 Load required libraries-
+The following packages were used for this part of the analysis. Make sure to install the packages if they are not already installed. 
+
+```{r}
+packages <- c("DEXSeq","Rsubread","tibble", "dplyr", "EnhancedVolcano", "edgeR")
+
+#Load libraries
+invisible(lapply(packages, library, character.only = TRUE))
+```
+
+### 3.2 Load the processed annotation file- 
+
+```{r}
+load("mm10_exon_anno.RData")
+```
+
+### 3.3 Read the bam files obtained in step 1.2.2(after mapping) as input for featureCounts.  
+Before running this step, make sure you have the folder containing bam files in the current working directory.
+
+```{r}
+# Read all bam files as input for featureCounts
+countData <- dir("bams", pattern=".bam$", full.names=T) %>%
+  featureCounts(filesToCount, annot.ext=anno, isGTFAnnotationFile=FALSE, minMQS=0, useMetaFeatures=FALSE, allowMultiOverlap=TRUE, largestOverlap = TRUE, countMultiMappingReads=FALSE, primaryOnly=TRUE, isPairedEnd=TRUE, nthreads = 12)
+
+# Non-specific filtering: Remove the exons with low counts 
+isexpr <- rownames(countData$counts)[rowSums(cpm(countData$counts) > 1) >= 3] 
+countData$counts <- countData$counts[rownames(countData$counts) %in% isexpr, ] 
+anno <- anno %>% filter(GeneID %in% rownames(countData$counts)) 
+
+# Remove genes with only 1 site and  NA in geneIDs
+dn <- anno %>% group_by(GeneID) %>% summarise(nsites=n()) %>% filter(nsites > 1 & !is.na(GeneID))
+anno <- anno %>% filter(GeneID %in% dn$GeneID)
+countData$counts <- countData$counts[rownames(countData$counts) %in% anno$GeneID, ]
+```
+
+# 4. Differential Splicing and Exon usage analysis
+
+## 4.1 Using DEXSeq pipeline for differential exon analysis
+
+### 4.1.1 Load library and create a sample table to define the experimental design
+```{r}
+library(DEXSeq) %>% invisible
+sampleTable = data.frame(
+   row.names = c( "Mbnl1KO_Thymus_1", "Mbnl1KO_Thymus_2", "Mbnl1KO_Thymus_3", 
+                 "WT_Thymus_1", "WT_Thymus_2", "WT_Thymus_3" ),
+   condition = rep(c("Mbnl1_KO", "WT"),c(3,3)), libType = rep(c("paired-end")))
+```
+NOTE: The row names should be consistent with the bam file names used by featureCounts to count the reads. sampleTable consists of details of each sample which includes- library-type and condition. This is required to define the contrasts or test group for detecting differential usage.
+
+### 4.1.2 Prepare the exon information file
+Exon information in form of GRanges object is required as an input to create DEXSeq object. Match the gene Ids with the read counts and extract their specific annotation present in the prepared annotation object to create exoninfo object.
+
+```{r}
+exoninfo = anno[anno$GeneID %in% rownames(countData$counts),]
+exoninfo <- GRanges (seqnames=  anno$Chr, 
+ranges= IRanges (start=anno$Start, end=anno$End, width = anno$Width), strand = Rle(anno$Strand))
+mcols(exoninfo)$TranscriptIDs <- anno$TranscriptIDs
+mcols(exoninfo)$Ticker <- anno$Ticker
+mcols(exoninfo)$ExonID <- anno$ExonID
+mcols(exoninfo)$n <- anno$n
+mcols(exoninfo)$GeneID <- anno$GeneID
+
+transcripts_l = strsplit(exoninfo$TranscriptIDs,  "\\,")
+
+#Save the countData, sampleTable and exoninfo and transcripts in one object for further use 
+save(countData, sampleTable, exoninfo, transcripts_l, file="AS_countdata.RData")
+```
+NOTE: Be careful with the names of the columns of the processed annotation file. With different annotations, the headers can change and cause a problem while running this step.
+
+### 4.1.3 Create DEXSeq object
+Use the read counts generated in step 3 and the exon information obtained from the previous step to create the DEXSeq object. The sampleData takes a data frame input defining the samples (and their attributes- library type and condition), 'design' uses sampleData to generate a design matrix for the differential testing. For feature information, exon ids, corresponding gene and transcripts are required.  
+
+```{r}
+dxd = DEXSeqDataSet(
+   countData$counts,
+   sampleData=sampleTable,
+   design= ~ sample + exon + condition:exon,
+   featureID = exoninfo$ExonID,
+   groupID = exoninfo$GeneID,
+   featureRanges = exoninfo,
+   transcripts = transcripts_l)
+```
+
+
+NOTE: This step might take some time. Once the object is created, explore the columns for initial understanding of data.
+
+```{r}
+# Explore/Inspect the DEXSeq object
+head(counts(dxd), 5)
+colData(dxd)
+split(seq_len(ncol(dxd)), colData(dxd)$exon)
+head(rowRanges(dxd),3)
+sampleAnnotation(dxd)
+```
+
+### 4.1.4 Normalisation and Dispersion Estimation
+Next, we perform the normalization and estimate the variability of the data using the following commands. 
+
+```{r}
+dxd = estimateSizeFactors(dxd) 
+dxd = estimateDispersions(dxd)
+```
+
+### 4.1.5 Testing for Differential exon Usage
+After the estimation of variation, we test for differential exon usage for each gene and generate the results. The results are calculated at FDR 10%.
+```{r}
+dxd = testForDEU(dxd)
+#Estimate fold changes
+dxd = estimateExonFoldChanges(dxd, fitExpToVar="condition")
+dxr = DEXSeqResults(dxd)
+dxr
+mcols(dxr)$description
+## ----tallyExons------------------------------------------------------------
+table(dxr$padj < 0.1)
+## ----tallyGenes------------------------------------------------------------
+table(tapply(dxr$padj < 0.1, dxr$groupID, any))
+```
+
+### 4.1.6 Visualization of splicing events
+The plotDEXSeq function was used for visualization of differential exons and transcripts. Use different gene names to explore the results 
+```{r}
+plotDEXSeq(dxr, "Mbnl1", legend=TRUE, cex.axis=1.2, cex=1.3, lwd=2)
+```
+
+To display transcripts use displayTranscripts=TRUE
+```{r}
+plotDEXSeq(dxr, "Mrpl15", displayTranscripts=TRUE, legend=TRUE, cex.axis=1.2, cex=1.3, lwd=2)
+```
+
+
+```{r}
+plotDEXSeq(dxr, "Cd1d1", expression=FALSE, splicing=TRUE, legend=TRUE, cex.axis=1.2, cex=1.3, lwd=2)
+```
+
+Generate plots for all the significant genes
+```{r}
+dxr = dxr[!is.na(dxr$padj),]	
+	dgene = data.frame(perGeneQValue=perGeneQValue(dxr)) %>% rownames_to_column("groupID")
+	
+	dexon = dxr %>% data.frame() %>% 
+			dplyr::select(-matches("dispersion|stat|countData|genomicData")) %>% 
+			inner_join(dgene) %>% arrange(perGeneQValue) %>% distinct()
+	
+dexon_sig = dexon %>% filter(padj < 0.1)  %>% dplyr::select(-transcripts)
+writexl::write_xlsx(dexon_sig,"Mbnl1_DEXseq_significant_genes.xlsx", col_names = TRUE)
+
+pdf(file= "DEXSeq_sig_Mbnl1KO_FDR_10.pdf", height = 15, width = 15)
+	sig_genes = dexon_sig %>% filter(perGeneQValue <= 0.1) %$%  groupID %>% unique
+	
+	for (geneid in sig_genes ) {
+		nn = nrow(dxr[dxr$groupID %in% geneid, ])
+		if (nn >1 ) {
+			plotDEXSeq(dxr, geneid, legend=TRUE,displayTranscripts=TRUE, splicing=TRUE,  cex.axis=1.2, cex=1.3, lwd=2 )
+		}
+	}
+	dev.off()
+```
+
+Volcano plot to visualize differentially expressed genes 
+```{r}
+EnhancedVolcano(dexon_sig, lab = dexon_sig$featureID, x = 'log2fold_WT_Mbnl1_KO', y = 'pvalue', title = 'Volcano Plot', subtitle = 'Mbnl1_KO vs WT (DEXSeq)', FCcutoff = 1, labSize = 4,legendPosition = "right",xlim= c(-4,4),caption = bquote(~Log[2]~ "Fold change cutoff, 2; FDR 10%"))
+```
+NOTE: EnhancedVolcano package was used to generate the above plot, you will need to install it if not already installed.
+
+
+### Save Rdata objects
+```{r}
+save.image("Mbnl1_KO_Dexseq.RData")
+```
+
+## 4.2 Using Limma diffSplice for differential splicing analysis
+
+### 4.2.1 Load libraries
+```{r}
+library(limma)
+library(edgeR)
+```
+
+### 4.2.2 Filtering-
+Create a list of features using DGEList, where rows represent genes and columns represent samples. For filtering step, counts are filtered by cpm (counts per million) less than 1 in 3 out of 6 samples.
+```{r}
+mycounts = countData$counts
+#Change the rownames of the countdata to exon Ids instead of genes for unique rownames.
+rownames(mycounts) = exoninfo$ExonID
+dge <- DGEList(counts=mycounts)
+
+#Filtering
+isexpr <- rowSums(cpm(dge) > 1) >=3
+dge <- dge[isexpr,,keep.lib.sizes=FALSE]
+
+#Extract the annotations for only filtered counts 
+exoninfo = anno %>% filter(ExonID %in% rownames(dge$counts)) 
+
+#Convert the exoninfo into GRanges object
+exoninfo1 <- GRanges (seqnames=  exoninfo$Chr, 
+ranges= IRanges (start=exoninfo$Start, end=exoninfo$End, width = exoninfo$Width), strand = Rle(exoninfo$Strand))
+mcols(exoninfo1)$TranscriptIDs <- exoninfo$TranscriptIDs
+mcols(exoninfo1)$Ticker <- exoninfo$Ticker
+mcols(exoninfo1)$ExonID <- exoninfo$ExonID
+mcols(exoninfo1)$n <- exoninfo$n
+mcols(exoninfo1)$GeneID <- exoninfo$GeneID
+transcripts_l = strsplit(exoninfo1$TranscriptIDs,  "\\,")
+```
+
+### 4.2.3 Normalize the counts- 
+Normalize the read counts using the TMM method.
+```{r}
+dge <- calcNormFactors(dge)
+```
+
+### 4.2.4 Create design matrix for comparisons
+Use sampleTable as generated in step 4.1.1 and create the design matrix
+```{r}
+Treat <- factor(sampleTable$condition)
+design <- model.matrix(~0+Treat)
+colnames(design) <- levels(Treat)
+```
+
+### 4.2.5 Differential expression with voom function
+Run voom function of limma to process RNA-seq data and then run linear modelling using lmfit
+```{r}
+v <- voom(dge, design, plot=FALSE)
+fit <- lmFit(v,design)
+fit  <- eBayes(fit)
+colnames(fit)
+summary(decideTests(fit))
+
+cont.matrix <- makeContrasts(
+				Mbnl1_KO_WT = Mbnl1_KO - WT, 
+				levels=design)
+fit2  <- contrasts.fit(fit, cont.matrix)
+summary(decideTests(fit2))
+```
+
+### 4.2.6 Differential Splicing analysis
+Run diffSplice on the fitted model to test the differences in exon retention between wild-type and knockout.
+
+```{r}
+ex <- diffSplice(fit2, geneid = exoninfo1$GeneID, exonid = exoninfo1$ExonID)
+
+#Check the top splicing results with topSplice
+topSplice(ex)
+```
+
+NOTE: This step uses the exon information object created in 4.1.2. Make sure it is loaded in the current working environment.
+
+### 4.2.7 Visualization
+Plot the differential splicing result for the top genes and save the results.
+```{r}
+plotSplice(ex, geneid="Mbnl1")
+#Save the results sorted by logFC
+ts <-topSplice(ex, n=Inf, FDR=0.1, test= "t", sort.by = "logFC")
+ts %$% GeneID %>% unique %>% length
+ts %$% ExonID %>% unique %>% length
+
+#Save the list of top differentially spliced exons at FDR 10%
+sig <- ts[ts$FDR<0.1,]
+  writexl::write_xlsx(sig,"Mbnl1_diffSplice_significant_genes.xlsx", col_names = TRUE)
+```
+
+### Volcano plot-
+Volcano plot showing up and downregulated genes at pCutoff = FDR 10% and FC 2.
+```{r}
+EnhancedVolcano(ts, lab = ts$ExonID, selectLab = head((ts$ExonID),3000),xlab = bquote(~Log[2]~ 'fold change'), x = 'logFC', y = 'P.Value', title = 'Volcano Plot', subtitle = 'Mbnl1_KO vs WT (Limma_diffSplice)', FCcutoff = 1, labSize = 4,legendPosition = "right",caption = bquote(~Log[2]~ "Fold change cutoff, 1; FDR 10%"))
+```
+  
+### Save the R object
+```{r}
+save.image("Mbnl1_KO_Limma_diffSplice.RData")
+```
+
+## 4.3 Using rMATS to identify different types of splicing events
+
+### 4.3.1 Download and Install rMATS
+Download and install rMATS v4.1.1 from- (https://github.com/Xinglab/rmats-turbo/releases/download/v4.1.1/rmats_turbo_v4_1_1.tar.gz) 
+
+### 4.3.2 Required Files
+For pairwise splicing analysis, we will need sorted bam files for all the samples generated after the read alignment step using STAR. prepare text 	files for two conditions by copying the name of bam files (along with the path) separated by ‘,’ comma. Following commands should be run on the terminal- 
+
+```{bash}
+cd bams/
+ls -pd "$PWD"/* | grep "WT" | tr '\n' ',' > Wt.txt
+ls -pd "$PWD"/* | grep "Mb" | tr '\n' ',' > KO.txt
+#Move the files to the main working directory
+mv *.txt /rMATS_analysis
+cd rMATS_analysis
+```
+
+### 4.3.3 Run rMATS
+
+Run the python script rmats.py with the two input files generated in the previous step, along with the 	GTF annotation.
+
+```{python}
+python rmats-turbo/rmats.py --b1 KO.txt --b2 Wt.txt --gtf annotation.gtf -t paired --readLength 50 --nthread 8 --od rmats_out/ --tmp rmats_tmp
+```
+
+NOTE:The reference annotation in the form of a GTF file is also required. Make sure both the folder containing bam files (bams/) and annotation file (annotation.gtf) is present in the current path/provide the correct path in the above command. (AS_analysis) Check the parameters if the data is single-end, change the -t option. 
+
+The results will be in the specified output directory by the -o option(rmats_out). The --tmp option creates a temporary subdirectory to store all the intermediate files in the analysis. The output folder contains text files for different splicing events with p-values. The summary.txt file presents the table of all the events falling in different categories.
+
+### 4.3.4 Exploring rMATS results
+
+We used a bioconductor package called 'maser' to explore the rMATS results.
+```{r}
+library(maser) %>% invisible
+mbnl1 <- maser("rMATS_analysis/rmats_out/", c("WT", "Mbnl1_KO"), ftype = "JCEC")
+#Filtering out events 
+mbnl1_filt <- filterByCoverage(mbnl1, avg_reads = 5)
+```
+
+### 4.3.4 Visualizing rMATS results
+
+```{r}
+#Top splicing events at 5% FDR 
+mbnl1_top <- topEvents(mbnl1_filt, fdr = 0.05, deltaPSI = 0.1)
+mbnl1_top
+
+#Check the gene events for a particular gene
+mbnl1_mapk <- geneEvents(mbnl1_filt, geneS = "Map4k4", fdr = 0.05, deltaPSI = 0.1)
+maser::display(mbnl1_mapk, "SE")
+plotGenePSI(mbnl1_mapk, type = "SE", show_replicates = TRUE)
+
+volcano(mbnl1_filt, fdr = 0.05, deltaPSI = 0.1, type = "SE") + xlab("deltaPSI") +ylab("Log10 Adj. Pvalue")+ ggtitle("Volcano Plot of exon skipping events")
+```
+
+Install 'rmats2sashimiplot' from github and use it to generate Sashimi plot for the splicing events result obtained with rMATS in form of text files. Make sure you go to the rmats2sashimiplot folder to run the python script. Also, double check the path of input files.
+
+```{python}
+python ./src/rmats2sashimiplot/rmats2sashimiplot.py --b1 ../bams/WT_Thymus_1.bam,../bams/WT_Thymus_2.bam,../bams/WT_Thymus_3.bam --b2 ../bams/Mbnl1KO_Thymus_1.bam,../bams/Mbnl1KO_Thymus_2.bam,../bams/Mbnl1KO_Thymus_3.bam -t SE -e ../rMATS_analysis/rmats_out/SE.MATS.JC.txt  --l1 WT --l2 Mbnl1_KO --exon_s 1 --intron_s 5 -o ../rMATS_analysis/rmats2shasmi_output
+```
+NOTE: This process will take a lot of time as it will generate the Sashimi plot for all the results in the events file (You might want to filter the results and then provide to this step).
+
+Choose the top results (gene names and exons)as displayed by the topEvents function from 'maser' and visualize the corresponding Sashimi plot.
+
+## Print Session Info-
+```{r}
+  print(sessionInfo())
+```
