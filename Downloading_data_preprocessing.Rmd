@@ -16,7 +16,7 @@ knitr::opts_chunk$set(echo = TRUE)
 The raw data can be downloaded from Sequence Read Archive [SRA] using the 'prefetch' command from SRA toolkit. Give the SRA Accession Ids in sequence in the following command to download them in parallel using GNU parallel. Once you have the raw files, extract the fastq files from these archive files with the help of 'fastq-dump'. Before converting .sra to fastq, copy/move the .sra file from each folder to your current working directory. 
 
 ```{bash}
-#Creat project directory to store raw data
+#Create project directory to store raw data
 PROJ_DIR=AS_analysis/
 mkdir $PROJ_DIR
 cd $PROJ_DIR
